@@ -8,14 +8,15 @@ import {
 import { assertEquals } from 'https://deno.land/std@0.90.0/testing/asserts.ts';
 
 Clarinet.test({
-    name: "Can register new content",
+    name: "Can register new content with subscription periods",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         
         let block = chain.mineBlock([
             Tx.contractCall('license-manager', 'register-content', [
                 types.uint(1000),
-                types.ascii("premium")
+                types.ascii("premium"),
+                types.list([types.uint(1), types.uint(3), types.uint(12)])
             ], deployer.address)
         ]);
         
@@ -24,7 +25,7 @@ Clarinet.test({
 });
 
 Clarinet.test({
-    name: "Can purchase license",
+    name: "Can purchase subscription license with auto-renewal",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const wallet1 = accounts.get('wallet_1')!;
@@ -32,10 +33,13 @@ Clarinet.test({
         let block = chain.mineBlock([
             Tx.contractCall('license-manager', 'register-content', [
                 types.uint(1000),
-                types.ascii("premium")
+                types.ascii("premium"),
+                types.list([types.uint(1), types.uint(3), types.uint(12)])
             ], deployer.address),
             Tx.contractCall('license-manager', 'purchase-license', [
-                types.uint(1)
+                types.uint(1),
+                types.uint(1),
+                types.bool(true)
             ], wallet1.address)
         ]);
         
@@ -44,7 +48,7 @@ Clarinet.test({
 });
 
 Clarinet.test({
-    name: "Can verify license status",
+    name: "Can renew subscription license",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const wallet1 = accounts.get('wallet_1')!;
@@ -52,15 +56,17 @@ Clarinet.test({
         let block = chain.mineBlock([
             Tx.contractCall('license-manager', 'register-content', [
                 types.uint(1000),
-                types.ascii("premium")
+                types.ascii("premium"), 
+                types.list([types.uint(1), types.uint(3), types.uint(12)])
             ], deployer.address),
             Tx.contractCall('license-manager', 'purchase-license', [
-                types.uint(1)
-            ], wallet1.address),
-            Tx.contractCall('license-manager', 'has-valid-license', [
                 types.uint(1),
-                types.principal(wallet1.address)
-            ], deployer.address)
+                types.uint(1),
+                types.bool(true)
+            ], wallet1.address),
+            Tx.contractCall('license-manager', 'renew-license', [
+                types.uint(1)
+            ], wallet1.address)
         ]);
         
         block.receipts[2].result.expectOk().expectBool(true);
