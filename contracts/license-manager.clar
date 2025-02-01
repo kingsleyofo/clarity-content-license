@@ -6,11 +6,16 @@
 (define-constant err-already-licensed (err u101))
 (define-constant err-not-licensed (err u102))
 (define-constant err-invalid-price (err u103))
+(define-constant err-invalid-period (err u104))
 
 ;; Data Maps
 (define-map licenses 
     { content-id: uint, licensee: principal }
-    { expires: uint, license-type: (string-ascii 10) }
+    { 
+        expires: uint,
+        license-type: (string-ascii 10),
+        auto-renew: bool
+    }
 )
 
 (define-map content-registry
@@ -18,7 +23,8 @@
     { 
         owner: principal,
         price: uint,
-        license-type: (string-ascii 10)
+        license-type: (string-ascii 10),
+        subscription-periods: (list 3 uint)
     }
 )
 
@@ -26,14 +32,18 @@
 (define-data-var next-content-id uint u1)
 
 ;; Register new content
-(define-public (register-content (price uint) (license-type (string-ascii 10)))
+(define-public (register-content 
+    (price uint) 
+    (license-type (string-ascii 10))
+    (subscription-periods (list 3 uint)))
     (let ((content-id (var-get next-content-id)))
         (map-set content-registry
             { content-id: content-id }
             { 
                 owner: tx-sender,
                 price: price,
-                license-type: license-type
+                license-type: license-type,
+                subscription-periods: subscription-periods
             }
         )
         (var-set next-content-id (+ content-id u1))
@@ -42,18 +52,23 @@
 )
 
 ;; Purchase license
-(define-public (purchase-license (content-id uint))
+(define-public (purchase-license 
+    (content-id uint)
+    (period-index uint)
+    (auto-renew bool))
     (let (
         (content (unwrap! (map-get? content-registry { content-id: content-id }) (err u404)))
         (existing-license (map-get? licenses { content-id: content-id, licensee: tx-sender }))
+        (period (unwrap! (element-at (get subscription-periods content) period-index) err-invalid-period))
     )
         (asserts! (is-none existing-license) err-already-licensed)
         (try! (stx-transfer? (get price content) tx-sender (get owner content)))
         (map-set licenses
             { content-id: content-id, licensee: tx-sender }
             { 
-                expires: (+ block-height u52560), ;; License valid for ~1 year
-                license-type: (get license-type content)
+                expires: (+ block-height (* period u525)) ;; period in months (525 blocks/month avg)
+                license-type: (get license-type content),
+                auto-renew: auto-renew
             }
         )
         (ok true)
@@ -81,6 +96,27 @@
         (map-set content-registry
             { content-id: content-id }
             (merge content { price: new-price })
+        )
+        (ok true)
+    )
+)
+
+;; Get license details
+(define-read-only (get-license-details (content-id uint) (address principal))
+    (ok (map-get? licenses { content-id: content-id, licensee: address }))
+)
+
+;; Renew existing license
+(define-public (renew-license (content-id uint))
+    (let (
+        (content (unwrap! (map-get? content-registry { content-id: content-id }) (err u404)))
+        (license (unwrap! (map-get? licenses { content-id: content-id, licensee: tx-sender }) err-not-licensed))
+    )
+        (asserts! (get auto-renew license) (err u105))
+        (try! (stx-transfer? (get price content) tx-sender (get owner content)))
+        (map-set licenses
+            { content-id: content-id, licensee: tx-sender }
+            (merge license { expires: (+ block-height u52560) })
         )
         (ok true)
     )
