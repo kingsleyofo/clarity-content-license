@@ -12,18 +12,22 @@
 (define-constant err-content-not-found (err u404))
 (define-constant err-unauthorized (err u106))
 (define-constant err-paused (err u107))
+(define-constant err-rate-limited (err u108))
+(define-constant err-reentrancy (err u109))
 
 ;; Data Variables
 (define-data-var next-content-id uint u1)
 (define-data-var contract-paused bool false)
+(define-data-var last-operation uint u0)
 
-;; Data Maps
+;; Enhanced Data Maps
 (define-map licenses 
     { content-id: uint, licensee: principal }
     { 
         expires: uint,
         license-type: (string-ascii 10),
-        auto-renew: bool
+        auto-renew: bool,
+        last-renewed: uint
     }
 )
 
@@ -34,27 +38,43 @@
         price: uint,
         license-type: (string-ascii 10),
         subscription-periods: (list 3 uint),
-        active: bool
+        active: bool,
+        metadata: (optional (string-utf8 256))
     }
 )
 
-;; Administrative Functions
-(define-public (toggle-contract-pause)
+(define-map rate-limits
+    { user: principal }
+    { last-purchase: uint, count: uint }
+)
+
+;; Reentrancy Protection
+(define-data-var reentrancy-guard uint u0)
+
+(define-private (check-reentrancy)
     (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (ok (var-set contract-paused (not (var-get contract-paused))))
+        (asserts! (is-eq (var-get reentrancy-guard) u0) err-reentrancy)
+        (var-set reentrancy-guard u1)
+        (ok true)
     )
 )
 
-;; Helper Functions
-(define-private (is-contract-paused)
-    (var-get contract-paused)
+(define-private (release-reentrancy)
+    (var-set reentrancy-guard u0)
 )
 
-(define-private (is-content-owner (content-id uint) (caller principal))
-    (match (map-get? content-registry { content-id: content-id })
-        content (is-eq (get owner content) caller)
-        false
+;; Rate Limiting
+(define-private (check-rate-limit (user principal))
+    (let ((current-limit (default-to 
+        { last-purchase: u0, count: u0 }
+        (map-get? rate-limits { user: user }))))
+        (if (is-eq (get last-purchase current-limit) block-height)
+            (asserts! (< (get count current-limit) u5) err-rate-limited)
+            (map-set rate-limits
+                { user: user }
+                { last-purchase: block-height, count: u1 }
+            )
+        )
     )
 )
 
@@ -62,9 +82,11 @@
 (define-public (register-content 
     (price uint) 
     (license-type (string-ascii 10))
-    (subscription-periods (list 3 uint)))
+    (subscription-periods (list 3 uint))
+    (metadata (optional (string-utf8 256))))
     (begin
         (asserts! (not (is-contract-paused)) err-paused)
+        (asserts! (> price u0) err-invalid-price)
         (let ((content-id (var-get next-content-id)))
             (map-set content-registry
                 { content-id: content-id }
@@ -73,7 +95,8 @@
                     price: price,
                     license-type: license-type,
                     subscription-periods: subscription-periods,
-                    active: true
+                    active: true,
+                    metadata: metadata
                 }
             )
             (var-set next-content-id (+ content-id u1))
@@ -82,30 +105,15 @@
     )
 )
 
-(define-public (remove-content (content-id uint))
-    (begin
-        (asserts! (not (is-contract-paused)) err-paused)
-        (asserts! (is-content-owner content-id tx-sender) err-unauthorized)
-        (match (map-get? content-registry { content-id: content-id })
-            content (begin
-                (map-set content-registry
-                    { content-id: content-id }
-                    (merge content { active: false })
-                )
-                (ok true)
-            )
-            (err err-content-not-found)
-        )
-    )
-)
-
-;; Enhanced License Management
+;; Enhanced License Purchase
 (define-public (purchase-license 
     (content-id uint)
     (period-index uint)
     (auto-renew bool))
     (begin
+        (try! (check-reentrancy))
         (asserts! (not (is-contract-paused)) err-paused)
+        (try! (check-rate-limit tx-sender))
         (let (
             (content (unwrap! (map-get? content-registry { content-id: content-id }) err-content-not-found))
             (existing-license (map-get? licenses { content-id: content-id, licensee: tx-sender }))
@@ -117,27 +125,42 @@
             (map-set licenses
                 { content-id: content-id, licensee: tx-sender }
                 { 
-                    expires: (+ block-height (* period u525))
+                    expires: (+ block-height (* period u525)),
                     license-type: (get license-type content),
-                    auto-renew: auto-renew
+                    auto-renew: auto-renew,
+                    last-renewed: block-height
                 }
             )
+            (release-reentrancy)
             (ok true)
         )
     )
 )
 
-;; Enhanced Read-Only Functions
-(define-read-only (has-valid-license (content-id uint) (address principal))
-    (match (map-get? licenses { content-id: content-id, licensee: address })
-        license (ok (and 
-            (< block-height (get expires license))
-            (get active (default-to 
-                { active: false } 
-                (map-get? content-registry { content-id: content-id })
-            ))
-        ))
-        (err err-not-licensed)
+;; Batch License Verification
+(define-read-only (verify-multiple-licenses (content-ids (list 10 uint)) (address principal))
+    (fold check-license content-ids (ok true))
+)
+
+(define-private (check-license (content-id uint) (previous-result (response bool uint)))
+    (match previous-result
+        success (has-valid-license content-id address)
+        failure failure
+    )
+)
+
+;; License Transfer
+(define-public (transfer-license (content-id uint) (recipient principal))
+    (begin
+        (asserts! (not (is-contract-paused)) err-paused)
+        (let ((license (unwrap! (map-get? licenses { content-id: content-id, licensee: tx-sender }) err-not-licensed)))
+            (map-delete licenses { content-id: content-id, licensee: tx-sender })
+            (map-set licenses
+                { content-id: content-id, licensee: recipient }
+                license
+            )
+            (ok true)
+        )
     )
 )
 
